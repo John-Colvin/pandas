@@ -925,7 +925,7 @@ class HDFStore(object):
         a,b,c,_,__ = self._prep_columns(obj, duplicates, data_start)
         info.update(a)
         types.update(b)
-        data.extend(c)   #possible bug
+        data.extend(c)
         
         if 'table_native' not in group:
             #create the table
@@ -948,7 +948,7 @@ class HDFStore(object):
             # the table must already exist
             table = getattr(group, name, None)
         
-        info['pandas_type'] = 'table_native'
+        info['pandas_type'] = _TYPE_MAP[type(obj)]
         table.attrs._pandas_info = info
         
         #write the data to the table
@@ -957,10 +957,10 @@ class HDFStore(object):
         self.handle.flush()
     
     def _read_series_table_native(self,group,where):
-        raise NotImplementedError
+        return _read_table_native(group,where)
     
     def _read_frame_table_native(self,group,where):
-        _read_table_native(group,where)
+        return _read_table_native(group,where)
     
     def _read_table_native(self,group,where):
         table = getattr(group, 'table_native')
@@ -969,7 +969,9 @@ class HDFStore(object):
         info = table.attrs._pandas_info
         
         #no selection implemented
-   
+        
+        #need to deal with tz info etc.
+        
         indices = []
         index_names = []
         column_names = []
@@ -986,10 +988,16 @@ class HDFStore(object):
 
         index = MultiIndex.from_arrays(indices,names=index_names)
         
-        if len(unique(column_names)) == len(column_names):
-            return DataFrame(dict(zip(column_names,data)),index=index)
+        kind = info['pandas_type']
+        if kind == 'series' and len(column_names) == 1:
+            return Series(data=data,index=index,name=column_names[0])
+        elif kind == 'frame':
+            if len(unique(column_names)) == len(column_names):
+                return DataFrame(dict(zip(column_names,data)),index=index)
+            else:
+                raise NotImplementedError, "No support for duplicate column names"
         else:
-            raise NotImplementedError, "No support for duplicate column names"
+            raise NotImplementedError, "Only series and frame are supported at this time"
 
     def _read_group(self, group, where=None):
         kind = getattr(group._v_attrs,'pandas_type',None)
