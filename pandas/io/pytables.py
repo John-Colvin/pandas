@@ -52,7 +52,8 @@ _NAME_MAP = {
     'long' : 'LongPanel',
     # new native types
     'frame_table_native' : 'DataFrame',
-    'series_table' : 'Series',
+    'series_table_native' : 'Series',
+    'panel_table_native' : 'Panel',
     # legacy h5 files
     'Series' : 'Series',
     'TimeSeries' : 'TimeSeries',
@@ -284,10 +285,11 @@ class HDFStore(object):
         exc_type = _tables().NoSuchNodeError
         try:
             group = getattr(self.handle.root, key)
-            return self._read_group(group)
         except (exc_type, AttributeError):
             raise KeyError('No object named %s in the file' % key)
 
+        return self._read_group(group)
+        
     def select(self, key, where=None):
         """
         Retrieve pandas object stored in file, optionally based on where
@@ -398,13 +400,11 @@ class HDFStore(object):
 
         kind = _TYPE_MAP[type(value)]
         if native or (append and _is_table_native_type(group)):
-            print 'native'
             kind = '%s_table_native' % kind
             handler = self._get_handler(op='write', kind=kind)
             wrapper = lambda value: handler(group, value, append=append,
-                                            comp=comp)
+                                            comp=comp)            
         elif table or (append and _is_table_type(group)):
-            print 'table'
             kind = '%s_table' % kind
             handler = self._get_handler(op='write', kind=kind)
             wrapper = lambda value: handler(group, value, append=append,
@@ -829,14 +829,26 @@ class HDFStore(object):
             raise
     
     def _write_series_table_native(self, group, s, append=False, comp=None):
-        self._write_table_native(group,s,append=append,comp=comp)
+        name = 'pandas_table_'+str(s.name)
+        group._v_attrs.tables = [name]
+        self._write_table_native(group,s,append=append,comp=comp,name=name)
                 
     def _write_frame_table_native(self, group, df, append=False, comp=None):
-        self._write_table_native(group,df,append=append,comp=comp)        
+        name = 'pandas_table'
+        group._v_attrs.tables = [name]
+        self._write_table_native(group,df,append=append,comp=comp,name=name)        
     
+    #must decide how to work with item indices.
+    #Write a seperate array using _write_index: easy, but not really useful for
+    #outside use
+    #Name each frame with a str(Index[i]) and store real index values in table attrs
+    #How to deal with multiIndex...
     def _write_panel_table_native(self, group, panel, append=False, comp=None):
+        group._v_attrs.tables = []
         for i,frame in enumerate(panel):
-            self._write_table_native(group, frame, 'panel_frame_'+str(i), append, comp)
+            name = 'panel_frame_'+str(i)
+            group._v_attrs.tables.append(name)
+            self._write_table_native(group, frame, name, append, comp)
             
     def _prep_index(self,obj,duplicates={},data_start=0):
         info = {}
@@ -927,7 +939,7 @@ class HDFStore(object):
         types.update(b)
         data.extend(c)
         
-        if 'table_native' not in group:
+        if name not in group:
             #create the table
             options = {'name' : name,
                        'description' : types}
@@ -957,13 +969,28 @@ class HDFStore(object):
         self.handle.flush()
     
     def _read_series_table_native(self,group,where):
-        return _read_table_native(group,where)
+        return self._read_table_native(group,where)
     
     def _read_frame_table_native(self,group,where):
-        return _read_table_native(group,where)
+        return self._read_table_native(group,where)
+        
+    #panel item index not sorted yet, use ints as placeholder
+    def _read_panel_table_native(self,group,where):
+        if where != None:
+            raise NotImplementedError, "selection not supported for panels (yet)"
+        frames = {}
+        for table in group._v_attrs.tables:
+            frames[0] = self._read_table_native(group,where,table)
+        
+        #assuming all of them have the same axes...
+        #It would be nice to have an n/a fill in case some data was added on some frames
+        #but not all.
+        return(Panel(frames))
     
-    def _read_table_native(self,group,where):
-        table = getattr(group, 'table_native')
+    def _read_table_native(self,group,where,name=None):
+        if name == None:
+            name = getattr(group._v_attrs, 'tables')[0]
+        table = getattr(group, name)
         
         #if not found then some sort of default behaviour maybe?
         info = table.attrs._pandas_info
@@ -990,7 +1017,7 @@ class HDFStore(object):
         
         kind = info['pandas_type']
         if kind == 'series' and len(column_names) == 1:
-            return Series(data=data,index=index,name=column_names[0])
+            return Series(data=data[0],index=index,name=column_names[0])
         elif kind == 'frame':
             if len(unique(column_names)) == len(column_names):
                 return DataFrame(dict(zip(column_names,data)),index=index)
