@@ -7,6 +7,7 @@ to disk
 
 from datetime import datetime, date
 import time
+from itertools import izip
 
 import numpy as np
 from pandas import (
@@ -49,6 +50,9 @@ _NAME_MAP = {
     'sparse_panel' : 'SparsePanel',
     'wide_table' : 'Panel (Table)',
     'long' : 'LongPanel',
+    # new native types
+    'frame_table_native' : 'DataFrame',
+    'series_table' : 'Series',
     # legacy h5 files
     'Series' : 'Series',
     'TimeSeries' : 'TimeSeries',
@@ -318,7 +322,7 @@ class HDFStore(object):
             return self._read_group(group, where)
 
     def put(self, key, value, table=False, append=False,
-            compression=None):
+            compression=None, native=False):
         """
         Store object in HDFStore
 
@@ -339,7 +343,7 @@ class HDFStore(object):
             be used.
         """
         self._write_to_group(key, value, table=table, append=append,
-                             comp=compression)
+                             comp=compression, native=native)
 
     def _get_handler(self, op, kind):
         return getattr(self,'_%s_%s' % (op, kind))
@@ -385,7 +389,7 @@ class HDFStore(object):
         self._write_to_group(key, value, table=True, append=True)
 
     def _write_to_group(self, key, value, table=False, append=False,
-                        comp=None):
+                        comp=None, native=False):
         root = self.handle.root
         if key not in root._v_children:
             group = self.handle.createGroup(root, key)
@@ -393,7 +397,14 @@ class HDFStore(object):
             group = getattr(root, key)
 
         kind = _TYPE_MAP[type(value)]
-        if table or (append and _is_table_type(group)):
+        if native or (append and _is_table_native_type(group)):
+            print 'native'
+            kind = '%s_table_native' % kind
+            handler = self._get_handler(op='write', kind=kind)
+            wrapper = lambda value: handler(group, value, append=append,
+                                            comp=comp)
+        elif table or (append and _is_table_type(group)):
+            print 'table'
             kind = '%s_table' % kind
             handler = self._get_handler(op='write', kind=kind)
             wrapper = lambda value: handler(group, value, append=append,
@@ -816,10 +827,178 @@ class HDFStore(object):
             except Exception:
                 pass
             raise
+    
+    def _write_series_table_native(self, group, s, append=False, comp=None):
+        self._write_table_native(group,s,append=append,comp=comp)
+                
+    def _write_frame_table_native(self, group, df, append=False, comp=None):
+        self._write_table_native(group,df,append=append,comp=comp)        
+    
+    def _write_panel_table_native(self, group, panel, append=False, comp=None):
+        for i,frame in enumerate(panel):
+            self._write_table_native(group, frame, 'panel_frame_'+str(i), append, comp)
+            
+    def _prep_index(self,obj,duplicates={},data_start=0):
+        info = {}
+        types = {}
+        data = []
+        for i in range(obj.index.nlevels):
+            name = obj.index.names[i]
+            if name == None:
+                str_name = 'index_%d'%i
+            else:
+                str_name = str(name)
+            if str_name in info:
+                if str_name in duplicates:
+                    duplicates[str_name] += 1
+                else:
+                    duplicates[str_name] = 1
+                str_name = str_name + '_%d'%duplicates[str_name]
+            
+            if isinstance(obj.index, MultiIndex):
+                values = obj.index.levels[i]
+            else:
+                values = obj.index.values
+            converted, kind, type = _convert_index(values,position=data_start+i)
+            
+            info[str_name] = {'name_data':name}
+            
+            if hasattr(values, 'freq'):
+                info[str_name]['freq'] = values.freq
+
+            if hasattr(values, 'tz') and values.tz is not None:
+                zone = lib.get_timezone(values.tz)
+                if zone is None:
+                    zone = lib.tot_seconds(values.tz.utcoffset())
+                info[str_name]['tz'] = zone      
+                  
+            info[str_name]['kind'] = kind
+            info[str_name]['isIndex'] = True
+            info[str_name]['position'] = i
+            types[str_name] = type
+            data.append(converted)
+        
+        return info,types,data,duplicates,i+1
+        
+    def _prep_columns(self,obj, duplicates={}, data_start=0):
+        info = {}
+        types = {}
+        data = []
+        if isinstance(obj, DataFrame):
+            cols = obj.columns
+            get_col = lambda o,n: o[n]
+        elif isinstance(obj, Series):
+            cols = [obj.name]
+            get_col = lambda o,n: o
+        else:
+            raise NotImplementedError, "object type not supported"    
+        
+        for i,name in enumerate(cols):
+            column = get_col(obj,name)
+            str_name = str(name)
+            if str_name in info:
+                if str_name in duplicates:
+                    duplicates[str_name] += 1
+                else:
+                    duplicates[str_name] = 1
+                str_name = str_name + '_%d'%duplicates[str_name]
+            
+            values = column.values
+            converted, kind, type = _convert_index(values,position=data_start+i)
+            
+            info[str_name] = {'name_data':name}
+            info[str_name]['kind'] = kind
+            info[str_name]['position'] = i
+            types[str_name] = type
+            data.append(converted)
+
+        return info,types,data,duplicates,i+1
+       
+    def _write_table_native(self, group, obj, name='table_native', append=False, comp=None):
+        # create the table if it doesn't exist (or get it if it does)
+        if not append:
+            if name in group:
+                self.handle.removeNode(group, name)
+
+        info, types, data, duplicates, data_start = self._prep_index(obj)
+        
+        a,b,c,_,__ = self._prep_columns(obj, duplicates, data_start)
+        info.update(a)
+        types.update(b)
+        data.extend(c)   #possible bug
+        
+        if 'table_native' not in group:
+            #create the table
+            options = {'name' : name,
+                       'description' : types}
+        
+            if comp:
+                complevel = self.complevel
+                if complevel is None:
+                    complevel = 9
+                filters = _tables().Filters(complevel=complevel,
+                                            complib=compression,
+                                            fletcher32=self.fletcher32)
+                options['filters'] = filters
+            elif self.filters is not None:
+                options['filters'] = self.filters
+                
+            table = self.handle.createTable(group, **options)
+        else:
+            # the table must already exist
+            table = getattr(group, name, None)
+        
+        info['pandas_type'] = 'table_native'
+        table.attrs._pandas_info = info
+        
+        #write the data to the table
+        table.append([a for a in izip(*data)])
+        
+        self.handle.flush()
+    
+    def _read_series_table_native(self,group,where):
+        raise NotImplementedError
+    
+    def _read_frame_table_native(self,group,where):
+        _read_table_native(group,where)
+    
+    def _read_table_native(self,group,where):
+        table = getattr(group, 'table_native')
+        
+        #if not found then some sort of default behaviour maybe?
+        info = table.attrs._pandas_info
+        
+        #no selection implemented
+   
+        indices = []
+        index_names = []
+        column_names = []
+        data = []
+        for i,col in enumerate(table.colnames):
+            if info[col].get('isIndex',False):
+                indices.append(_maybe_convert(table.read(field=col),
+                                              info[col]['kind']))
+                index_names.append(info[col]['name_data'])
+            else:
+                data.append(_maybe_convert(table.read(field=col),
+                                           info[col]['kind']))
+                column_names.append(info[col]['name_data'])
+
+        index = MultiIndex.from_arrays(indices,names=index_names)
+        
+        if len(unique(column_names)) == len(column_names):
+            return DataFrame(dict(zip(column_names,data)),index=index)
+        else:
+            raise NotImplementedError, "No support for duplicate column names"
 
     def _read_group(self, group, where=None):
-        kind = group._v_attrs.pandas_type
+        kind = getattr(group._v_attrs,'pandas_type',None)
+        
+        if kind == None:
+            #redirect to native here?
+            raise KeyError, "No pandas type identifier found for group"
         kind = _LEGACY_MAP.get(kind, kind)
+        
         handler = self._get_handler(op='read', kind=kind)
         return handler(group, where)
 
@@ -933,12 +1112,12 @@ class HDFStore(object):
         self.handle.flush()
         return len(s.values)
 
-def _convert_index(index):
+def _convert_index(index, position=None):
     if isinstance(index, DatetimeIndex):
         converted = index.asi8
-        return converted, 'datetime64', _tables().Int64Col()
+        return converted, 'datetime64', _tables().Int64Col(pos=position)
     elif isinstance(index, (Int64Index, PeriodIndex)):
-        atom = _tables().Int64Col()
+        atom = _tables().Int64Col(pos=position)
         return index.values, 'integer', atom
 
     if isinstance(index, MultiIndex):
@@ -950,32 +1129,32 @@ def _convert_index(index):
 
     if inferred_type == 'datetime64':
         converted = values.view('i8')
-        return converted, 'datetime64', _tables().Int64Col()
+        return converted, 'datetime64', _tables().Int64Col(pos=position)
     elif inferred_type == 'datetime':
         converted = np.array([(time.mktime(v.timetuple()) +
                             v.microsecond / 1E6) for v in values],
                             dtype=np.float64)
-        return converted, 'datetime', _tables().Time64Col()
+        return converted, 'datetime', _tables().Time64Col(pos=position)
     elif inferred_type == 'date':
         converted = np.array([time.mktime(v.timetuple()) for v in values],
                             dtype=np.int32)
-        return converted, 'date', _tables().Time32Col()
+        return converted, 'date', _tables().Time32Col(pos=position)
     elif inferred_type =='string':
         converted = np.array(list(values), dtype=np.str_)
         itemsize = converted.dtype.itemsize
-        return converted, 'string', _tables().StringCol(itemsize)
+        return converted, 'string', _tables().StringCol(itemsize,pos=position)
     elif inferred_type == 'unicode':
-        atom = _tables().ObjectAtom()
+        atom = _tables().ObjectAtom(pos=position)
         return np.asarray(values, dtype='O'), 'object', atom
     elif inferred_type == 'integer':
         # take a guess for now, hope the values fit
-        atom = _tables().Int64Col()
+        atom = _tables().Int64Col(pos=position)
         return np.asarray(values, dtype=np.int64), 'integer', atom
     elif inferred_type == 'floating':
-        atom = _tables().Float64Col()
+        atom = _tables().Float64Col(pos=position)
         return np.asarray(values, dtype=np.float64), 'float', atom
     else: # pragma: no cover
-        atom = _tables().ObjectAtom()
+        atom = _tables().ObjectAtom(pos=position)
         return np.asarray(values, dtype='O'), 'object', atom
 
 def _read_array(group, key):
@@ -1056,6 +1235,12 @@ def _is_table_type(group):
         return 'table' in group._v_attrs.pandas_type
     except AttributeError:
         # new node, e.g.
+        return False
+        
+def _is_table_native_type(group):
+    try:
+        return 'table_native' in group._v_attrs._pandas_info['pandas_type']
+    except AttributeError:
         return False
 
 _index_type_map = {DatetimeIndex : 'datetime',
